@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WAISM Cafe</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8f9fa; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .animate-fade-in { animation: fadeIn 0.3s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+
+    <div id="app" class="min-h-screen relative"></div>
+
+    <script>
+        // =================================================================
+        // RUANGAN KONFIGURASI
+        // =================================================================
+        
+        const SHEET_ID = '1KXsjIeFuVJbOzK7RDi77PmYYYD5_Kxicm1lkm2Kqgag'; 
+        const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxGACbgJS7t6bHy7Yl39iy67HrGnbN4cpQZ5I3OM0QFbSC47nwVPdOwP5qx6b5L1qbb/exec'; 
+        const LOGO_URL = 'https://drive.google.com/file/d/1pi7ccRsPv6V1CCvJZzql1oGllhhn3blN/view?usp=drive_link'; 
+        const DEFAULT_URL_CHECK = 'https://script.google.com/macros/s/AKfycbyw5V2H8Nn1zO6qE5qG9r4tF7s8u3vX0yLpQ1mK2j9wR4tN5z8/exec';
+
+        const state = {
+            view: 'landing', activeAdminTab: 'incoming', user: null, cart: [], 
+            menu: [], orders: [], category: 'Semua', isCartOpen: false, 
+            lastOrder: null, processingIds: new Set() 
+        };
+
+        // =================================================================
+        // PENGURUSAN DATA (GOOGLE SHEETS)
+        // =================================================================
+        
+        function fetchSheetData(sheetName) {
+            return new Promise((resolve) => {
+                const cb = 'cb_' + Math.floor(Math.random()*100000);
+                const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=responseHandler:${cb}&sheet=${sheetName}&range=A:H&headers=1&_nc=${Date.now()}`;
+                const timeoutId = setTimeout(() => { delete window[cb]; resolve([]); }, 8000);
+
+                window[cb] = (json) => {
+                    clearTimeout(timeoutId);
+                    delete window[cb];
+                    try { resolve(processGviz(json, sheetName)); } catch(e) { resolve([]); }
+                };
+                const s = document.createElement('script'); s.src = url; document.body.appendChild(s);
+            });
+        }
+
+        function processGviz(json, sheetName) {
+            if (!json || !json.table) return [];
+            
+            const cleanImage = (url) => {
+                if (!url || typeof url !== 'string') return '';
+                url = url.trim();
+                if (url.includes('drive.google.com/thumbnail')) return url;
+                if (url.includes('google.com')) {
+                    const match = url.match(/id=([a-zA-Z0-9_-]+)/) || url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+                    if (match && match[1]) return `https://drive.google.com/thumbnail?id=${match[1]}&sz=w500`;
+                }
+                return url;
+            };
+
+            return json.table.rows.map(r => {
+                const c = r.c;
+                const val = (i) => (c[i] && c[i].v !== null) ? c[i].v : '';
+                if (sheetName === 'Menu') {
+                    let price = val(3);
+                    if (typeof price === 'string') price = parseFloat(price.replace(/[^0-9.-]+/g,""));
+                    return { 
+                        id: val(0), name: val(1), category: val(2), price: isNaN(price) ? 0 : price, 
+                        isavailable: String(val(4)).toLowerCase() === 'true', image: cleanImage(val(5)) 
+                    };
+                } else if (sheetName === 'Orders') {
+                    if (!val(0)) return null; 
+                    return { 
+                        id: String(val(0)), timestamp: (c[1]&&c[1].f) ? c[1].f : val(1), 
+                        customer: val(2), table: val(3), items: val(4), total: val(5), 
+                        status: String(val(6)||'Pending').trim() 
+                    };
+                }
+            }).filter(d => d && d.id && String(d.id).toLowerCase() !== 'id');
+        }
+
+        async function postToSheet(action, payload) {
+            if (SCRIPT_URL === DEFAULT_URL_CHECK) { alert("Sila update SCRIPT_URL!"); return { status: 'error' }; }
+            try {
+                await fetch(SCRIPT_URL, {
+                    method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ action, ...payload })
+                });
+                updateLocalState(action, payload, payload.id || 'TEMP');
+                return { status: 'success' };
+            } catch (error) { return { status: 'error', message: error.toString() }; }
+        }
+
+        function updateLocalState(action, payload, tempId) {
+            if (action === 'add_menu') {
+                state.menu.push({ id: Date.now(), name: payload.name, category: payload.category, price: parseFloat(payload.price), isavailable: true, image: payload.image });
+            }
+            if (action === 'update_status') {
+                const o = state.orders.find(x => String(x.id) === String(payload.id));
+                if (o) o.status = payload.status;
+                if (state.activeAdminTab !== 'menu') render();
+            }
+            if (action === 'update_menu_status') {
+                const i = state.menu.find(x => String(x.id) === String(payload.id));
+                if (i) i.isavailable = payload.isavailable;
+                render(); 
+            }
+            if (action === 'new_order') {
+                state.orders.push({ id: tempId, customer: payload.customer, table: payload.table, items: payload.items, total: payload.total, status: 'Pending', timestamp: new Date().toLocaleTimeString() });
+            }
+        }
+
+        // =================================================================
+        // LOGIK PENGASINGAN ORDER (DIBAIKI)
+        // =================================================================
+        
+        function getOrderComposition(order) {
+            const items = order.items.split(',').map(i => i.trim()).filter(i => i !== "");
+            let hasFood = false;
+            let hasDrink = false;
+            
+            const drinkKeywords = /teh|kopi|coffee|latte|cafe|air|jus|juice|limau|sirap|milo|nescafe|horlicks|bancuh|coke|soda|minuman/i;
+
+            items.forEach(i => {
+                const name = i.replace(/^\d+x\s*/, '').trim();
+                const m = state.menu.find(x => x.name.toLowerCase() === name.toLowerCase());
+                
+                let isDrink = false;
+                if (m) {
+                    isDrink = (m.category === 'Minuman');
+                } else {
+                    isDrink = drinkKeywords.test(name);
+                }
+                
+                if (isDrink) hasDrink = true;
+                else hasFood = true;
+            });
+            return { hasFood, hasDrink };
+        }
+
+        // =================================================================
+        // KAWALAN UI & RENDER UTAMA
+        // =================================================================
+        
+        function setView(v) { state.view = v; if(v==='admin-dashboard') refreshData(false); render(); }
+        
+        async function refreshData(m = false) {
+            const btn = document.getElementById('refreshBtn');
+            if (m && btn) btn.innerText = '...';
+            
+            const fetchedOrders = await fetchSheetData('Orders');
+            if (fetchedOrders) {
+                const mergedOrders = fetchedOrders.map(serverOrder => {
+                    const localOrder = state.orders.find(l => String(l.id) === String(serverOrder.id));
+                    if (localOrder && state.processingIds.has(String(serverOrder.id))) return localOrder; 
+                    return serverOrder;
+                });
+                fetchedOrders.forEach(serverOrder => {
+                    if (!state.orders.find(l => String(l.id) === String(serverOrder.id))) mergedOrders.push(serverOrder);
+                });
+                state.orders = mergedOrders;
+            }
+
+            if (m || ['menu', 'kitchen', 'bar', 'incoming'].includes(state.activeAdminTab)) {
+                const mn = await fetchSheetData('Menu');
+                if (mn && mn.length > 0) {
+                    const unsaved = state.menu.filter(l => !mn.find(s => s.name === l.name) && (Date.now() - l.id) < 60000);
+                    state.menu = [...mn, ...unsaved];
+                }
+            }
+
+            if (state.view === 'admin-dashboard' && state.activeAdminTab !== 'menu') render();
+            else if (m) render();
+            
+            if (m) setTimeout(() => { if(btn) btn.innerHTML='<i data-lucide="refresh-cw" class="w-4 h-4"></i> <span id="refreshText">Refresh Data</span>'; lucide.createIcons(); }, 500);
+        }
+
+        function render() {
+            const app = document.getElementById('app'); app.innerHTML = '';
+            if (state.view === 'landing') app.innerHTML = renderLanding();
+            else if (state.view === 'customer') app.innerHTML = renderCustomer();
+            else if (state.view === 'admin-login') app.innerHTML = renderAdminLogin();
+            else if (state.view === 'admin-dashboard') app.innerHTML = renderAdminDashboard();
+            lucide.createIcons();
+        }
+
+        function getLogoHtml(isHeader) {
+            const cleanLogo = (url) => {
+                if (!url || !url.includes('google.com')) return url || '';
+                const match = url.match(/id=([a-zA-Z0-9_-]+)/) || url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+                if (match && match[1]) return `https://drive.google.com/thumbnail?id=${match[1]}&sz=w500`;
+                return url;
+            };
+            const src = LOGO_URL ? cleanLogo(LOGO_URL) : '';
+            if (isHeader) {
+                if (src) return `<img src="${src}" class="w-10 h-10 rounded-full object-cover bg-white border border-orange-200 shadow-sm">`;
+                return `<div class="bg-orange-500 w-10 h-10 flex items-center justify-center rounded-full text-white shadow-sm"><i data-lucide="utensils" class="w-5 h-5"></i></div>`;
+            } else {
+                if (src) return `<img src="${src}" class="mx-auto mb-4 w-28 h-28 object-cover bg-white rounded-full p-1 shadow-lg">`;
+                return `<div class="mx-auto mb-4 w-24 h-24 bg-orange-500 rounded-full flex items-center justify-center shadow-lg"><i data-lucide="chef-hat" class="w-12 h-12 text-white"></i></div>`;
+            }
+        }
+
+        // =================================================================
+        // PANDANGAN (VIEWS)
+        // =================================================================
+
+        function renderLanding() {
+            return `<div class="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-orange-500 to-orange-600 text-white p-6">
+                <div class="text-center bg-white/10 backdrop-blur-md p-8 rounded-3xl shadow-xl w-full max-w-md animate-fade-in border border-white/20">
+                    ${getLogoHtml(false)}
+                    <h1 class="text-3xl font-bold mb-2">WAISM Cafe</h1>
+                    <p class="text-orange-100 mb-8 text-sm">Sistem Pesanan Pintar</p>
+                    <div class="space-y-4">
+                        <button onclick="setView('customer')" class="w-full flex items-center justify-center gap-3 bg-white text-orange-600 py-4 px-6 rounded-xl font-bold hover:bg-orange-50 transition shadow-lg hover:-translate-y-1 duration-200"><i data-lucide="utensils" class="w-5 h-5"></i> Masuk Pelanggan</button>
+                        </div>
+                </div>
+            </div>`;
+        }
+
+        function renderCustomer() {
+            const filtered = state.category === 'Semua' ? state.menu : state.menu.filter(m => m.category === state.category);
+            const total = state.cart.reduce((a,b) => a + (b.price*b.qty), 0);
+            
+            return `<div class="pb-24 max-w-5xl mx-auto">
+                <header class="bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-30 px-4 py-4 flex justify-between items-center border-b border-gray-100">
+                    <div class="flex items-center gap-3 cursor-pointer group" onclick="setView('landing')">
+                        ${getLogoHtml(true)} 
+                        <div>
+                            <h1 class="font-bold text-lg leading-tight text-gray-900 group-hover:text-orange-600 transition">Rasa Sayang</h1>
+                            <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Cafe</p>
+                        </div>
+                    </div>
+                    <button onclick="toggleCart(true)" class="relative p-2.5 bg-gray-50 hover:bg-orange-50 rounded-full border border-gray-200 transition">
+                        <i data-lucide="shopping-bag" class="text-gray-700 w-5 h-5"></i>
+                        ${state.cart.length > 0 ? `<span class="absolute -top-1.5 -right-1.5 bg-orange-600 text-white text-xs font-bold w-5 h-5 flex items-center justify-center rounded-full shadow-sm">${state.cart.reduce((a,b)=>a+b.qty,0)}</span>` : ''}
+                    </button>
+                </header>
+                
+                <div class="px-4 py-4 flex gap-2 overflow-x-auto no-scrollbar sticky top-[73px] z-20 bg-gray-50 border-b border-gray-100 shadow-sm">
+                    ${['Semua','Makanan','Minuman','Dessert'].map(c => 
+                        `<button onclick="setCategory('${c}')" class="px-5 py-2 rounded-full text-sm font-semibold whitespace-nowrap transition-all duration-200 ${state.category===c ? 'bg-orange-600 text-white shadow-md' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-100'}">${c}</button>`
+                    ).join('')}
+                </div>
+
+                <div class="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    ${filtered.length === 0 ? '<div class="col-span-full text-center py-20 text-gray-400 flex flex-col items-center"><i data-lucide="search-x" class="w-12 h-12 mb-3 opacity-20"></i> Tiada menu dijumpai.</div>' : ''}
+                    ${filtered.map(item => `
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden flex h-[120px] hover:shadow-md transition-all duration-200 group ${!item.isavailable?'opacity-50 grayscale':''}">
+                        <!-- GAMBAR (OBJECT-CONTAIN PENUH) -->
+                        <div class="w-[120px] h-full bg-gray-50 flex-shrink-0 relative flex items-center justify-center p-2 border-r border-gray-50">
+                            ${item.image ? `<img src="${item.image}" class="w-full h-full object-contain rounded-xl group-hover:scale-105 transition duration-300" referrerpolicy="no-referrer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">` : ''}
+                            <div class="absolute inset-0 flex items-center justify-center text-3xl opacity-20 ${item.image?'hidden':''}">${item.category==='Minuman'?'🥤':'🍛'}</div>
+                        </div>
+                        
+                        <!-- INFO (KANAN) -->
+                        <div class="p-3.5 flex-1 flex flex-col justify-between">
+                            <div>
+                                <h3 class="font-bold text-sm text-gray-800 leading-snug line-clamp-2">${item.name}</h3>
+                                <p class="text-[10px] text-gray-400 mt-0.5 font-medium">${item.category}</p>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="font-bold text-orange-600">RM ${parseFloat(item.price).toFixed(2)}</span>
+                                ${item.isavailable ? 
+                                    `<button onclick="addToCart('${item.id}')" class="bg-orange-50 text-orange-600 p-2 rounded-xl hover:bg-orange-100 active:bg-orange-200 transition">
+                                        <i data-lucide="plus" class="w-4 h-4"></i>
+                                    </button>` : 
+                                    `<span class="text-[10px] font-bold text-red-500 bg-red-50 px-2 py-1 rounded-md">Habis</span>`}
+                            </div>
+                        </div>
+                    </div>`).join('')}
+                </div>
+                ${state.isCartOpen ? renderCartModal(total) : ''}
+            </div>`;
+        }
+
+        function renderCartModal(total) {
+            return `<div class="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex justify-end animate-fade-in">
+                <div class="w-full max-w-md bg-white h-full flex flex-col shadow-2xl">
+                    <div class="p-5 border-b border-gray-100 flex justify-between items-center bg-white">
+                        <h2 class="font-bold text-lg flex items-center gap-2 text-gray-800"><i data-lucide="shopping-bag" class="w-5 h-5 text-orange-500"></i> Troli Pesanan</h2>
+                        <button onclick="toggleCart(false)" class="p-2 bg-gray-50 rounded-full hover:bg-gray-100 text-gray-500 transition"><i data-lucide="x" class="w-5 h-5"></i></button>
+                    </div>
+                    <div class="flex-1 overflow-y-auto p-5 space-y-4 bg-gray-50">
+                        ${state.cart.length===0 ? '<div class="text-center py-20 text-gray-400 flex flex-col items-center"><i data-lucide="shopping-cart" class="w-16 h-16 mb-4 opacity-20"></i><p>Troli anda kosong.</p></div>' : ''}
+                        ${state.cart.map(i => `
+                            <div class="flex justify-between items-center bg-white p-3 rounded-xl shadow-sm border border-gray-100">
+                                <div><h4 class="font-bold text-sm text-gray-800">${i.name}</h4><p class="text-xs text-orange-600 font-medium">RM ${i.price.toFixed(2)}</p></div>
+                                <div class="flex items-center gap-3 bg-gray-50 rounded-lg p-1 border border-gray-100">
+                                    <button onclick="updateQty('${i.id}', -1)" class="p-1 hover:text-red-500 text-gray-500"><i data-lucide="minus" class="w-4 h-4"></i></button>
+                                    <span class="font-bold w-4 text-center text-sm">${i.qty}</span>
+                                    <button onclick="updateQty('${i.id}', 1)" class="p-1 hover:text-green-500 text-gray-500"><i data-lucide="plus" class="w-4 h-4"></i></button>
+                                </div>
+                            </div>`).join('')}
+                    </div>
+                    ${state.cart.length>0 ? `
+                    <div class="p-5 border-t border-gray-100 bg-white shadow-[0_-4px_15px_-3px_rgba(0,0,0,0.05)]">
+                        <div class="flex justify-between items-center mb-5">
+                            <span class="text-gray-500 font-medium">Jumlah Pembayaran</span>
+                            <span class="text-2xl font-bold text-orange-600">RM ${total.toFixed(2)}</span>
+                        </div>
+                        <input id="custName" placeholder="Nama Pelanggan" class="w-full p-3.5 bg-gray-50 border border-gray-200 rounded-xl mb-3 text-sm focus:ring-2 focus:ring-orange-500 outline-none transition">
+                        <input id="tableNo" placeholder="Nombor Meja (Cth: 5)" class="w-full p-3.5 bg-gray-50 border border-gray-200 rounded-xl mb-5 text-sm focus:ring-2 focus:ring-orange-500 outline-none transition">
+                        <button onclick="placeOrder()" class="w-full py-4 rounded-xl font-bold flex justify-center items-center gap-2 transition duration-200 bg-orange-600 text-white hover:bg-orange-700 shadow-lg shadow-orange-200">
+                            Hantar Pesanan <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                        </button>
+                    </div>` : ''}
+                </div>
+            </div>`;
+        }
+
+        function renderAdminLogin() {
+            return `<div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-gray-50 to-gray-200 p-4">
+                <div class="bg-white p-8 rounded-3xl shadow-xl w-full max-w-sm border border-gray-100 animate-fade-in text-center">
+                    <div class="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4"><i data-lucide="lock" class="w-8 h-8 text-gray-600"></i></div>
+                    <h2 class="text-2xl font-bold mb-6 text-gray-800">Admin Login</h2>
+                    <input type="password" id="adminPass" placeholder="Kata Laluan" class="w-full p-3.5 border border-gray-200 rounded-xl mb-4 bg-gray-50 text-center focus:ring-2 focus:ring-gray-900 outline-none">
+                    <button onclick="handleLogin()" class="w-full bg-gray-900 text-white py-3.5 rounded-xl font-bold hover:bg-gray-800 transition">Log Masuk</button>
+                    <p class="text-center text-xs text-gray-400 mt-4">Hint: admin123</p>
+                    <button onclick="setView('landing')" class="w-full text-center text-sm text-gray-500 mt-4 font-medium hover:text-gray-800">Kembali ke Laman Utama</button>
+                </div>
+            </div>`;
+        }
+
+        function renderAdminDashboard() {
+            const tabBtn = (id, icon, txt) => `<button onclick="setAdminTab('${id}')" class="w-full text-left p-3 rounded-xl flex items-center gap-3 font-medium transition duration-200 ${state.activeAdminTab===id ? 'bg-orange-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-100'}"><i data-lucide="${icon}" class="w-5 h-5"></i> ${txt}</button>`;
+            
+            let content = '';
+            if (state.activeAdminTab === 'menu') content = renderAdminMenu();
+            else if (state.activeAdminTab === 'incoming') content = renderIncomingOrders(); 
+            else if (state.activeAdminTab === 'kitchen') content = renderStationOrders('Makanan');
+            else if (state.activeAdminTab === 'bar') content = renderStationOrders('Minuman');
+            else if (state.activeAdminTab === 'payment') content = renderPaymentOrders();
+
+            return `<div class="min-h-screen bg-gray-50 flex flex-col md:flex-row">
+                <aside class="bg-white w-full md:w-64 border-r border-gray-100 shadow-[4px_0_24px_rgba(0,0,0,0.02)] z-10 flex flex-col">
+                    <div class="p-6">
+                        <h2 class="text-xl font-bold text-gray-800 flex items-center gap-2"><i data-lucide="layout-dashboard" class="text-orange-500"></i> Admin Panel</h2>
+                    </div>
+                    <div class="flex-1 px-4 space-y-1 overflow-y-auto">
+                        ${tabBtn('incoming','list-ordered','Masuk (Pending)')}
+                        
+                        <div class="text-[10px] text-gray-400 font-bold mt-6 mb-2 uppercase tracking-wider pl-3">Stesen Operasi</div>
+                        ${tabBtn('kitchen','chef-hat','Dapur (Makanan)')}
+                        ${tabBtn('bar','coffee','Bar (Minuman)')}
+                        
+                        <div class="text-[10px] text-gray-400 font-bold mt-6 mb-2 uppercase tracking-wider pl-3">Pengurusan</div>
+                        ${tabBtn('payment','credit-card','Bayaran (Ready)')}
+                        ${tabBtn('menu','menu','Menu Sistem')}
+                    </div>
+                    <div class="p-4 border-t border-gray-100">
+                        <button onclick="setView('landing')" class="w-full text-red-500 text-sm flex items-center justify-center gap-2 font-semibold p-3 hover:bg-red-50 rounded-xl transition"><i data-lucide="log-out" class="w-4 h-4"></i> Log Keluar</button>
+                    </div>
+                </aside>
+                <main class="flex-1 p-6 md:p-8 overflow-y-auto">
+                    <div class="flex justify-between items-center mb-8">
+                        <div>
+                            <h2 class="text-2xl font-bold text-gray-800">Dashboard</h2>
+                            <p class="text-sm text-gray-500">Uruskan pesanan dan menu restoran anda.</p>
+                        </div>
+                        <button id="refreshBtn" onclick="refreshData(true)" class="flex items-center gap-2 bg-white px-4 py-2.5 rounded-xl shadow-sm text-sm font-semibold text-gray-700 border border-gray-200 hover:bg-gray-50 transition active:scale-95"><i data-lucide="refresh-cw" class="w-4 h-4"></i> <span id="refreshText">Refresh Data</span></button>
+                    </div>
+                    ${content}
+                </main>
+            </div>`;
+        }
+
+        function renderIncomingOrders() {
+            const list = state.orders.filter(o => String(o.status).toLowerCase() === 'pending').reverse();
+            if(!list.length) return `<div class="p-16 text-center bg-white rounded-2xl border border-dashed border-gray-300 flex flex-col items-center justify-center"><div class="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4"><i data-lucide="inbox" class="w-8 h-8 text-gray-400"></i></div><h3 class="font-bold text-gray-700">Tiada Pesanan Baru</h3><p class="text-sm text-gray-400 mt-1">Pesanan pelanggan akan dipaparkan di sini.</p></div>`;
+            
+            return `<div class="grid md:grid-cols-2 xl:grid-cols-3 gap-5">${list.map(o => {
+                const items = o.items.split(',').map(i=>i.trim()).filter(i=>i!=="");
+                const foods = [], drinks = [];
+                const drinkRegex = /teh|kopi|coffee|latte|cafe|air|jus|juice|limau|sirap|milo|nescafe|horlicks|bancuh|coke|soda|minuman/i;
+
+                items.forEach(i => {
+                    const name = i.replace(/^\d+x\s*/, '').trim();
+                    const m = state.menu.find(x => x.name.toLowerCase() === name.toLowerCase());
+                    let isDrink = m ? m.category === 'Minuman' : false;
+                    if (!m) isDrink = drinkRegex.test(name);
+                    if(isDrink) drinks.push(i); else foods.push(i);
+                });
+
+                return `<div class="bg-white p-5 rounded-2xl shadow-sm border border-orange-200 hover:shadow-md transition relative overflow-hidden flex flex-col">
+                    <div class="absolute top-0 left-0 w-1.5 h-full bg-orange-400"></div>
+                    <div class="flex justify-between items-start border-b border-gray-100 pb-3 mb-3">
+                        <div class="pl-2">
+                            <span class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Meja</span>
+                            <div class="text-3xl font-black text-gray-800 leading-none mt-1">${o.table}</div>
+                        </div>
+                        <div class="text-right">
+                             <div class="text-xs font-mono text-gray-500 bg-gray-50 border border-gray-100 px-2 py-1 rounded-md inline-block">${o.timestamp}</div>
+                             <div class="text-sm font-semibold mt-2 text-gray-700 truncate max-w-[120px]">${o.customer}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="space-y-3 mb-4 flex-1">
+                        ${foods.length > 0 ? `<div class="bg-orange-50/50 p-2.5 rounded-xl border border-orange-100/50"><div class="text-[10px] font-bold text-orange-600 mb-1.5 uppercase flex items-center gap-1.5"><i data-lucide="chef-hat" class="w-3.5 h-3.5"></i> Dapur (Makanan)</div><div class="text-sm text-gray-800 font-medium pl-1 leading-relaxed">${foods.join('<br>')}</div></div>` : ''}
+                        ${drinks.length > 0 ? `<div class="bg-blue-50/50 p-2.5 rounded-xl border border-blue-100/50"><div class="text-[10px] font-bold text-blue-600 mb-1.5 uppercase flex items-center gap-1.5"><i data-lucide="coffee" class="w-3.5 h-3.5"></i> Bar (Minuman)</div><div class="text-sm text-gray-800 font-medium pl-1 leading-relaxed">${drinks.join('<br>')}</div></div>` : ''}
+                    </div>
+
+                    <div class="flex justify-between items-center mt-auto border-t border-gray-100 pt-3">
+                        <span class="text-xs text-gray-500 font-medium">Total Harga</span>
+                        <span class="font-black text-lg text-orange-600">RM ${parseFloat(o.total).toFixed(2)}</span>
+                    </div>
+                    <div class="flex gap-2 mt-4 pt-1">
+                        <button onclick="updateStatus('${o.id}', 'Cancelled')" class="border border-red-200 text-red-600 px-4 py-3 rounded-xl text-sm font-bold flex-1 hover:bg-red-50 hover:border-red-300 transition focus:ring-2 focus:ring-red-200 outline-none">Tolak</button>
+                        <button onclick="updateStatus('${o.id}', 'Preparing')" class="bg-gray-900 text-white px-4 py-3 rounded-xl text-sm font-bold flex-[2] hover:bg-gray-800 transition shadow-lg shadow-gray-200 focus:ring-2 focus:ring-gray-900 outline-none">Terima Pesanan</button>
+                    </div>
+                </div>`;
+            }).join('')}</div>`;
+        }
+
+        // =================================================================
+        // STESEN OPERASI & PENGURUSAN PESANAN
+        // =================================================================
+        function renderOrders(filter, btnTxt, nextStat) {
+            const list = state.orders.filter(o => String(o.status).toLowerCase() === filter.toLowerCase()).reverse();
+            const showPrint = filter === 'Ready';
+            if(!list.length) return `<div class="p-12 text-center text-gray-400 bg-white rounded-xl shadow-sm">Tiada order ${filter}</div>`;
+            return `<div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">${list.map(o => {
+                const orderData = encodeURIComponent(JSON.stringify(o));
+                return `<div class="bg-white p-5 rounded-xl shadow-sm border border-gray-100 hover:shadow-md transition">
+                    <div class="flex justify-between border-b pb-3 mb-3"><div><span class="text-xs font-bold text-gray-500 uppercase">Meja</span><div class="text-2xl font-bold text-gray-800">${o.table}</div></div><div class="text-right"><div class="font-semibold text-gray-700">${o.customer}</div><div class="text-xs text-gray-400 font-mono mt-1">${o.timestamp}</div></div></div>
+                    <div class="text-sm text-gray-700 mb-4 bg-gray-50 p-3 rounded-lg leading-relaxed">${o.items.replace(/,/g, '<br>')}</div>
+                    <div class="flex justify-between font-bold text-xl mb-4 text-orange-600 border-t pt-3"><span>Total</span><span>RM ${parseFloat(o.total).toFixed(2)}</span></div>
+                    <div class="flex gap-2">${showPrint ? `<button onclick="printReceipt(JSON.parse(decodeURIComponent('${orderData}')))" class="bg-gray-100 p-3 rounded-lg hover:bg-gray-200 text-gray-600"><i data-lucide="printer" class="w-5 h-5"></i></button>` : ''}<div class="flex-1"><button onclick="updateStatus('${o.id}', '${nextStat}')" class="bg-gray-900 text-white w-full py-3 rounded-lg text-sm font-bold flex items-center justify-center gap-2 hover:bg-gray-800 shadow-md transition">${btnTxt} <i data-lucide="arrow-right" class="w-4 h-4"></i></button></div></div>
+                </div>`;
+            }).join('')}</div>`;
+        }
+
+        function renderStationOrders(categoryFilter) {
+            const list = state.orders.filter(o => {
+                const s = String(o.status);
+                if (categoryFilter === 'Makanan') return s === 'Preparing' || s === 'Ready_Drink';
+                if (categoryFilter === 'Minuman') return s === 'Preparing' || s === 'Ready_Food';
+                return false;
+            });
+            const stationOrders = list.map(o => {
+                const items = o.items.split(',').map(i => i.trim());
+                const drinkRegex = /teh|kopi|coffee|latte|cafe|air|jus|juice|limau|sirap|milo|nescafe|horlicks|bancuh|coke|soda|minuman/i;
+
+                const relevantItems = items.filter(itemStr => {
+                    const itemName = itemStr.replace(/^\d+x\s*/, '').trim(); 
+                    const menuItem = state.menu.find(m => m.name.toLowerCase() === itemName.toLowerCase());
+                    
+                    let isDrink = false;
+                    if (menuItem) {
+                        isDrink = (menuItem.category === 'Minuman');
+                    } else {
+                        isDrink = drinkRegex.test(itemName);
+                    }
+                    
+                    if (categoryFilter === 'Minuman') return isDrink;
+                    if (categoryFilter === 'Makanan') return !isDrink; // Semua selain minuman (termasuk Dessert) pergi ke Dapur
+                    
+                    return false;
+                });
+                
+                if (relevantItems.length > 0) return { ...o, items: relevantItems.join(', ') };
+                return null;
+            }).filter(o => o !== null);
+
+            if(!stationOrders.length) return `<div class="p-12 text-center text-gray-400 bg-white rounded-xl shadow-sm">Tiada order untuk ${categoryFilter}</div>`;
+            return `<div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">${stationOrders.map(o=> `<div class="bg-white p-5 rounded-xl shadow-sm border border-l-4 ${categoryFilter==='Minuman'?'border-l-blue-500':'border-l-orange-500'} hover:shadow-md transition"><div class="flex justify-between border-b pb-3 mb-3 font-bold"><span>Meja ${o.table}</span><span class="text-xs font-normal text-gray-500">${o.timestamp}</span></div><div class="text-sm mb-4 font-mono bg-gray-50 p-3 rounded-lg min-h-[80px] leading-relaxed text-gray-700">${o.items.split(',').join('<br>')}</div><div class="flex justify-end"><button onclick="updateStationStatus('${o.id}', '${categoryFilter}')" class="bg-green-600 text-white px-6 py-2.5 rounded-lg text-sm hover:bg-green-700 w-full font-bold shadow-md transition">Siap ${categoryFilter}</button></div></div>`).join('')}</div>`;
+        }
+
+        function renderPaymentOrders() {
+            const list = state.orders.filter(o => ['Ready', 'Ready_Food', 'Ready_Drink'].includes(String(o.status))).reverse();
+            if(!list.length) return `<div class="p-16 text-center bg-white rounded-2xl border border-dashed border-gray-300 flex flex-col items-center justify-center"><div class="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4"><i data-lucide="credit-card" class="w-8 h-8 text-gray-400"></i></div><h3 class="font-bold text-gray-700">Tiada Pembayaran</h3><p class="text-sm text-gray-400 mt-1">Sila siapkan order di dapur/bar dahulu.</p></div>`;
+            
+            return `<div class="grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">${list.map(o => {
+                const orderData = encodeURIComponent(JSON.stringify(o));
+                const isFullyReady = o.status === 'Ready';
+                const statusLabel = isFullyReady ? 'Sedia Dihidang' : (o.status === 'Ready_Food' ? 'Makanan Sahaja' : 'Minuman Sahaja');
+                const statusColor = isFullyReady ? 'text-green-600 bg-green-50 border-green-200' : 'text-orange-600 bg-orange-50 border-orange-200';
+                
+                const displayItems = o.items.split(',').map(i=>i.trim()).filter(i=>i!=="").join('<br>');
+
+                return `<div class="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
+                    <div class="flex justify-between items-start border-b border-gray-100 pb-3 mb-3">
+                        <div>
+                            <span class="text-[10px] font-bold uppercase text-gray-400 tracking-wider">Meja</span>
+                            <div class="text-2xl font-black text-gray-800 leading-none mt-1">${o.table}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="font-bold text-sm text-gray-700">${o.customer}</div>
+                            <div class="text-[10px] ${statusColor} border font-bold mt-1.5 px-2 py-0.5 rounded uppercase inline-block">${statusLabel}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="text-sm text-gray-600 mb-5 h-20 overflow-y-auto bg-gray-50 p-3 rounded-xl border border-gray-100 leading-relaxed font-medium">
+                        ${displayItems}
+                    </div>
+                    
+                    <div class="flex justify-between font-black text-xl mb-4 text-gray-900 border-t border-gray-100 pt-4">
+                        <span class="text-base text-gray-500 font-medium self-center">Jumlah</span>
+                        <span>RM ${parseFloat(o.total).toFixed(2)}</span>
+                    </div>
+                    
+                    <div class="flex gap-2 mt-auto">
+                        <button onclick="printReceipt(JSON.parse(decodeURIComponent('${orderData}')))" class="bg-gray-100 p-3.5 rounded-xl hover:bg-gray-200 text-gray-600 transition flex items-center justify-center focus:ring-2 focus:ring-gray-300 outline-none" title="Cetak Resit">
+                            <i data-lucide="printer" class="w-5 h-5"></i>
+                        </button>
+                        <button onclick="updateStatus('${o.id}', 'Completed')" class="flex-1 bg-gray-900 text-white py-3.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:bg-gray-800 shadow-lg shadow-gray-200 transition focus:ring-2 focus:ring-gray-900 outline-none">
+                            <i data-lucide="check" class="w-4 h-4"></i> Selesai
+                        </button>
+                    </div>
+                </div>`;
+            }).join('')}</div>`;
+        }
+
+        // FUNGSI RESIT (FORMAT THERMAL & HARGA)
+        function printReceipt(order) {
+            if (!order) return alert("Tiada data resit.");
+            
+            const itemsHtml = order.items.split(',').map(i => {
+                const parts = i.trim().match(/^(\d+)x\s+(.+)$/);
+                let qty = 1; let name = i.trim();
+                
+                if (parts) { qty = parseInt(parts[1]); name = parts[2]; }
+
+                const menuItem = state.menu.find(m => m.name.trim().toLowerCase() === name.trim().toLowerCase());
+                const unitPrice = menuItem ? menuItem.price : 0;
+                const lineTotal = unitPrice > 0 ? (unitPrice * qty).toFixed(2) : '';
+                
+                return `
+                <div style="display:flex; justify-content:space-between; margin-bottom: 5px;">
+                    <span style="text-align:left;">${qty} x ${name}</span>
+                    <span>${lineTotal}</span>
+                </div>`;
+            }).join('');
+
+            const receiptContent = `
+                <html>
+                <head>
+                    <title>Resit - WAISM Cafe</title>
+                    <style>
+                        body { font-family: 'Courier New', monospace; padding: 20px; max-width: 320px; margin: 0 auto; color: #000; font-size: 13px; }
+                        .text-center { text-align: center; }
+                        .text-right { text-align: right; }
+                        .bold { font-weight: bold; }
+                        .line { border-top: 1px dashed #000; margin: 10px 0; }
+                        .my-2 { margin-top: 10px; margin-bottom: 10px; }
+                        .header { font-size: 1.2em; font-weight: bold; text-transform: uppercase; margin-bottom: 5px; }
+                        .items { width: 100%; }
+                    </style>
+                </head>
+                <body>
+                    <div class="text-center header">WAISM CAFE</div>
+                    <div class="text-center">Kota Bharu</div>
+                    <div class="line"></div>
+                    <div>Tarikh: ${new Date().toLocaleString('en-MY')}</div>
+                    <div>Meja: ${order.table}</div>
+                    <div>Pelanggan: ${order.customer}</div>
+                    <div class="line"></div>
+                    <div class="items">${itemsHtml}</div>
+                    <div class="line"></div>
+                    <div class="text-right bold" style="font-size: 1.2em;">
+                        Total: RM ${parseFloat(order.total).toFixed(2)}
+                    </div>
+                    <div class="text-center my-2" style="margin-top: 20px;">
+                        Terima Kasih!<br>
+                        Sila Datang Lagi
+                    </div>
+                    <script>window.onload = function() { window.print(); window.close(); }<\/script>
+                </body>
+                </html>
+            `;
+            
+            const win = window.open('', '', 'width=350,height=600');
+            win.document.write(receiptContent);
+            win.document.close();
+        }
+
+        // =================================================================
+        // ADMIN MENU
+        // =================================================================
+        function renderAdminMenu() {
+            return `
+            <div class="bg-white p-6 md:p-8 rounded-2xl shadow-sm border border-gray-100 mb-8 max-w-4xl">
+                <h3 class="text-lg font-bold mb-5 flex items-center gap-2 text-gray-800"><i data-lucide="plus-circle" class="text-orange-500 w-5 h-5"></i> Tambah Menu Baru (URL)</h3>
+                <div class="grid md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5">Nama Menu</label>
+                        <input id="newMenuName" placeholder="Cth: Nasi Lemak" class="border border-gray-200 bg-gray-50 p-3 rounded-xl w-full focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none transition text-sm font-medium">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5">Harga (RM)</label>
+                        <input id="newMenuPrice" type="number" placeholder="0.00" class="border border-gray-200 bg-gray-50 p-3 rounded-xl w-full focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none transition text-sm font-medium">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5">Kategori</label>
+                        <select id="newMenuCategory" class="border border-gray-200 bg-gray-50 p-3 rounded-xl w-full focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none transition text-sm font-medium cursor-pointer">
+                            <option>Makanan</option>
+                            <option>Minuman</option>
+                            <option>Dessert</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-1.5">URL Gambar (Dari Google)</label>
+                        <input id="newMenuImageUrl" placeholder="Tampal Image Address di sini" class="border border-gray-200 bg-gray-50 p-3 rounded-xl w-full text-sm focus:ring-2 focus:ring-orange-500 focus:bg-white outline-none transition font-medium">
+                    </div>
+                    <div class="md:col-span-2 pt-2">
+                        <button onclick="submitNewMenu()" class="w-full bg-orange-600 text-white p-3.5 rounded-xl font-bold hover:bg-orange-700 transition shadow-lg shadow-orange-200 focus:ring-2 focus:ring-orange-500 outline-none flex items-center justify-center gap-2">
+                            <i data-lucide="save" class="w-4 h-4"></i> Simpan Menu
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden max-w-4xl">
+                <div class="p-5 bg-gray-50 border-b border-gray-100 font-bold text-gray-800 flex justify-between items-center">
+                    <span class="flex items-center gap-2"><i data-lucide="list" class="w-4 h-4 text-gray-400"></i> Senarai Menu Aktif (${state.menu.length})</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-white border-b border-gray-100">
+                            <tr>
+                                <th class="p-4 font-semibold text-gray-500 uppercase tracking-wider text-xs">Menu</th>
+                                <th class="p-4 font-semibold text-gray-500 uppercase tracking-wider text-xs">Kategori</th>
+                                <th class="p-4 font-semibold text-gray-500 uppercase tracking-wider text-xs">Harga</th>
+                                <th class="p-4 font-semibold text-gray-500 uppercase tracking-wider text-xs text-right">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-50 bg-white">
+                            ${state.menu.length === 0 ? '<tr><td colspan="4" class="p-8 text-center text-gray-400 font-medium">Tiada menu direkodkan.</td></tr>' : 
+                            state.menu.slice().reverse().map(m=>`
+                            <tr class="hover:bg-orange-50/30 transition duration-150">
+                                <td class="p-4 font-bold text-gray-800 flex items-center gap-3">
+                                    ${m.image ? `<img src="${m.image}" class="w-10 h-10 rounded-lg object-cover border border-gray-100 shadow-sm" referrerpolicy="no-referrer">` : `<div class="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center text-gray-400 text-xs shadow-sm border border-gray-100"><i data-lucide="image" class="w-4 h-4"></i></div>`}
+                                    ${m.name}
+                                </td>
+                                <td class="p-4 text-gray-500 font-medium">${m.category}</td>
+                                <td class="p-4 font-bold text-orange-600">RM ${parseFloat(m.price).toFixed(2)}</td>
+                                <td class="p-4 text-right">
+                                    <button onclick="toggleMenuStatus('${m.id}', ${m.isavailable})" class="px-3 py-1.5 rounded-lg text-xs font-bold transition outline-none ${m.isavailable?'bg-green-50 text-green-600 hover:bg-green-100 border border-green-200':'bg-red-50 text-red-600 hover:bg-red-100 border border-red-200'}">
+                                        ${m.isavailable?'✔ Ada':'❌ Habis'}
+                                    </button>
+                                </td>
+                            </tr>`).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+
+        // =================================================================
+        // ACTIONS / INTERAKSI
+        // =================================================================
+        function setCategory(c) { state.category = c; render(); }
+        function toggleCart(o) { state.isCartOpen = o; render(); }
+        function setAdminTab(t) { state.activeAdminTab = t; render(); }
+        
+        function addToCart(id) { const i=state.menu.find(m=>m.id==id); const c=state.cart.find(x=>x.id==id); if(c)c.qty++; else state.cart.push({...i,qty:1}); render(); }
+        function updateQty(id,d) { state.cart=state.cart.map(i=>i.id==id?{...i,qty:Math.max(0,i.qty+d)}:i).filter(i=>i.qty>0); render(); }
+        
+        async function placeOrder() {
+            const n=document.getElementById('custName').value, t=document.getElementById('tableNo').value;
+            if(!n||!t) return alert("Sila isi Nama Pelanggan dan Nombor Meja.");
+            const btn = document.querySelector('button[onclick="placeOrder()"]'); btn.innerHTML=`<i data-lucide="loader-2" class="w-5 h-5 spin"></i> Menghantar...`; btn.disabled=true; lucide.createIcons();
+            const res = await postToSheet('new_order', {customer:n, table:t, items:state.cart.map(i=>`${i.qty}x ${i.name}`).join(', '), total:state.cart.reduce((a,b)=>a+(b.price*b.qty),0)});
+            if(res.status==='success') { alert("Pesanan berjaya dihantar! Sila tunggu makanan anda dihidangkan."); state.cart=[]; state.isCartOpen=false; render(); } else { alert("Gagal menghantar pesanan. Sila cuba lagi."); render(); }
+        }
+        
+        async function submitNewMenu() {
+            const n=document.getElementById('newMenuName').value, p=document.getElementById('newMenuPrice').value, c=document.getElementById('newMenuCategory').value, u=document.getElementById('newMenuImageUrl').value;
+            if(!n || !p) return alert("Sila isi sekurang-kurangnya Nama Menu dan Harga.");
+            const btn = document.querySelector('button[onclick="submitNewMenu()"]'); btn.innerHTML=`<i data-lucide="loader-2" class="w-4 h-4 spin"></i> Menyimpan...`; btn.disabled=true; lucide.createIcons();
+            const res = await postToSheet('add_menu', {name:n, price:p, category:c, image:u});
+            if(res.status==='success') { alert("Menu baru berjaya ditambah!"); document.getElementById('newMenuName').value=''; document.getElementById('newMenuPrice').value=''; document.getElementById('newMenuImageUrl').value=''; btn.innerHTML=`<i data-lucide="save" class="w-4 h-4"></i> Simpan Menu`; btn.disabled=false; await refreshData(true); render(); } else { alert("Gagal menambah menu."); btn.innerHTML=`<i data-lucide="save" class="w-4 h-4"></i> Simpan Menu`; btn.disabled=false; lucide.createIcons(); }
+        }
+        
+        async function updateStatus(id, s) { 
+            const o = state.orders.find(x => x.id == id);
+            if(o) o.status = s;
+            state.processingIds.add(String(id));
+            setTimeout(() => { state.processingIds.delete(String(id)); }, 20000);
+            render();
+            if(s === 'Preparing') alert("Pesanan diterima! Dihantar ke Stesen Operasi (Dapur/Bar).");
+            const res = await postToSheet('update_status',{id,status:s}); 
+            if(res.status==='success') setTimeout(() => refreshData(false), 2000); 
+        }
+
+        async function updateStationStatus(id, type) {
+            const order = state.orders.find(x => x.id == id);
+            if (!order) return;
+            
+            const comp = getOrderComposition(order);
+            let nextStatus = order.status;
+
+            if (type === 'Makanan') {
+                if (order.status === 'Ready_Drink') nextStatus = 'Ready';
+                else if (order.status === 'Preparing') {
+                    nextStatus = comp.hasDrink ? 'Ready_Food' : 'Ready';
+                }
+            } 
+            else if (type === 'Minuman') {
+                if (order.status === 'Ready_Food') nextStatus = 'Ready';
+                else if (order.status === 'Preparing') {
+                    nextStatus = comp.hasFood ? 'Ready_Drink' : 'Ready';
+                }
+            }
+            updateStatus(id, nextStatus);
+        }
+        
+        async function toggleMenuStatus(id, currentStatus) { 
+            const newStatus = !currentStatus;
+            const item = state.menu.find(m => m.id == id);
+            if(item) { item.isavailable = newStatus; render(); }
+            const res = await postToSheet('update_menu_status',{id, isavailable:newStatus}); 
+            if(res.status !== 'success') {
+                alert("Gagal kemaskini status menu.");
+                if(item) { item.isavailable = currentStatus; render(); }
+            } else {
+                refreshData(false);
+            }
+        }
+
+        function handleLogin() { if(document.getElementById('adminPass').value === 'admin123') setView('admin-dashboard'); else alert("Kata laluan salah. Sila cuba lagi."); }
+        function renderAdminLogin() { return `<div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-gray-50 to-gray-200 p-4"><div class="bg-white p-8 rounded-3xl shadow-xl w-full max-w-sm border border-gray-100 animate-fade-in text-center"><div class="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4"><i data-lucide="lock" class="w-8 h-8 text-gray-600"></i></div><h2 class="text-2xl font-bold mb-6 text-gray-800">Admin Login</h2><input type="password" id="adminPass" placeholder="Kata Laluan" class="w-full p-3.5 border border-gray-200 rounded-xl mb-4 bg-gray-50 text-center focus:ring-2 focus:ring-gray-900 outline-none"><button onclick="handleLogin()" class="w-full bg-gray-900 text-white py-3.5 rounded-xl font-bold hover:bg-gray-800 transition">Log Masuk</button><p class="text-center text-xs text-gray-400 mt-4">Hint: admin123</p><button onclick="setView('landing')" class="w-full text-center text-sm text-gray-500 mt-4 font-medium hover:text-gray-800">Kembali ke Laman Utama</button></div></div>`; }
+
+        // =================================================================
+        // INIT PENGHIDUP SISTEM
+        // =================================================================
+        async function init() { 
+            render(); 
+            await refreshData(true); 
+            setInterval(() => { if(state.view === 'admin-dashboard') refreshData(false); }, 10000); 
+        }
+        init();
+
+    </script>
+</body>
+</html>
+
